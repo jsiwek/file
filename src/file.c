@@ -101,7 +101,7 @@ private const struct option long_options[] = {
 #undef OPT_LONGONLY
     {0, 0, NULL, 0}
 };
-#define OPTSTRING	"bcCde:Ef:F:hiklLm:nNprsvz0"
+#define OPTSTRING	"bBcCde:Ef:F:hiklLm:nNprsvz0"
 
 private const struct {
 	const char *name;
@@ -184,6 +184,9 @@ main(int argc, char *argv[])
 			break;
 		case 'b':
 			bflag++;
+			break;
+		case 'B':
+			action = FILE_BRO;
 			break;
 		case 'c':
 			action = FILE_CHECK;
@@ -288,6 +291,7 @@ main(int argc, char *argv[])
 	case FILE_CHECK:
 	case FILE_COMPILE:
 	case FILE_LIST:
+	case FILE_BRO:
 		/*
 		 * Don't try to check/compile ~/.magic unless we explicitly
 		 * ask for it.
@@ -307,6 +311,9 @@ main(int argc, char *argv[])
 			break;
 		case FILE_LIST:
 			c = magic_list(magic, magicfile);
+			break;
+		case FILE_BRO:
+			c = magic_bro(magic, magicfile);
 			break;
 		default:
 			abort();

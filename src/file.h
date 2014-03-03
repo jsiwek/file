@@ -140,6 +140,7 @@
 #define FILE_CHECK	1
 #define FILE_COMPILE	2
 #define FILE_LIST	3
+#define FILE_BRO	4
 
 union VALUETYPE {
 	uint8_t b;

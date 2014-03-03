@@ -278,6 +278,14 @@ magic_list(struct magic_set *ms, const char *magicfile)
 	return file_apprentice(ms, magicfile, FILE_LIST);
 }
 
+public int
+magic_bro(struct magic_set *ms, const char *magicfile)
+{
+	if (ms == NULL)
+		return -1;
+	return file_apprentice(ms, magicfile, FILE_BRO);
+}
+
 private void
 close_and_restore(const struct magic_set *ms, const char *name, int fd,
     const struct stat *sb)

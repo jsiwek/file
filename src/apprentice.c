@@ -109,6 +109,7 @@ private int apprentice_1(struct magic_set *, const char *, int);
 private size_t apprentice_magic_strength(const struct magic *);
 private int apprentice_sort(const void *, const void *);
 private void apprentice_list(struct mlist *, int );
+private void apprentice_bro_sigs(const struct mlist*, const struct magic_set*);
 private struct magic_map *apprentice_load(struct magic_set *, 
     const char *, int);
 private struct mlist *mlist_alloc(void);
@@ -398,6 +399,1031 @@ add_mlist(struct mlist *mlp, struct magic_map *map, size_t idx)
 	return 0;
 }
 
+private void
+oom_exit()
+	{
+	fprintf(stderr, "out of memory");
+	exit(1);
+	}
+
+private int
+on_big_endian()
+	{
+	union {
+		uint32_t i32;
+		uint8_t bytes[4];
+	} test = { 0x01000000 };
+
+	return test.bytes[0] == 1;
+	}
+
+private int
+bro_sig_compat_type(struct magic* m)
+	{
+	switch ( m->type ) {
+	case FILE_BYTE:
+
+	case FILE_SHORT:
+	case FILE_LESHORT:
+	case FILE_BESHORT:
+
+	case FILE_LONG:
+	case FILE_BELONG:
+	case FILE_LELONG:
+
+	case FILE_QUAD:
+	case FILE_BEQUAD:
+	case FILE_LEQUAD:
+
+	case FILE_STRING:
+	case FILE_REGEX:
+	case FILE_SEARCH:
+
+	case FILE_DEFAULT:
+		return 1;
+
+	default:
+		return 0;
+	}
+	}
+
+private void
+print_char(char c, int only_alphanum)
+	{
+	if ( c == '/' )
+		{
+		// This always needs escaping because it's used to bookend Bro patterns.
+		printf("\\x%02x", (unsigned char)c);
+		return;
+		}
+	
+	if ( isprint(c) )
+		{
+		if ( only_alphanum )
+			{
+			if ( isalnum(c) )
+				{
+				printf("%c", c);
+				return;
+				}
+			}
+		else
+			{
+			printf("%c", c);
+			return;
+			}
+		}
+
+	printf("\\x%02x", (unsigned char)c);
+	}
+
+private void
+check_magic_offsets(struct magic* mmpath, size_t n)
+	{
+	for ( size_t i = 0; i < n; ++i )
+		{
+		struct magic* m = &mmpath[i];
+
+		if ( m->flag & OFFADD || m->flag & INDIR || m->flag & INDIROFFADD )
+			printf("# CHECKME: use of indirect or relative offset\n");
+		}
+	}
+
+private void
+check_magic_fixed_match_length(struct magic* mmpath, size_t n)
+	{
+	for ( size_t i = 0; i < n; ++i )
+		{
+		struct magic* m = &mmpath[i];
+
+		if ( ! IS_STRING(m->type) )
+			continue;
+
+		switch ( m->type ) {
+		case FILE_STRING:
+			if ( m->str_flags )
+				if ( m->str_flags & STRING_COMPACT_WHITESPACE ||
+				     m->str_flags & STRING_COMPACT_OPTIONAL_WHITESPACE )
+					//printf("# CHECKME: use of string whitespace compaction\n");
+					;
+			break;
+		case FILE_REGEX:
+			printf("# CHECKME: use of regex type (check grammar and escaping)\n");
+			break;
+		case FILE_SEARCH:
+			//printf("# CHECKME: use of search string type\n");
+			break;
+		default:
+			printf("# CHECKME: unknown magic string type: %d\n", m->type);
+		}
+		}
+	}
+
+private void
+check_magic_type_compat(struct magic* mmpath, size_t n)
+	{
+	for ( size_t i = 0; i < n; ++i )
+		{
+		struct magic* m = &mmpath[i];
+
+		if ( ! bro_sig_compat_type(m) )
+			printf("# CHECKME: unknown magic type: %d\n", m->type);
+		}
+	}
+
+private void
+check_magic_offset_order(struct magic* mmpath, size_t n)
+	{
+	for ( size_t i = 0; i < n; ++i )
+		{
+		struct magic* m = &mmpath[i];
+
+		if ( m->flag & OFFADD || m->flag & INDIR || m->flag & INDIROFFADD )
+			// Difference check/warning for these situations
+			return;
+		}
+
+	for ( size_t i = 1; i < n; ++i )
+		{
+		if ( mmpath[i].offset <= mmpath[i - 1].offset )
+			printf("# CHECKME: weird offset ordering\n");
+		}
+	}
+
+private void
+check_magic_bitmask_usage(struct magic* mmpath, size_t n)
+	{
+	for ( size_t i = 0; i < n; ++i )
+		{
+		struct magic* m = &mmpath[i];
+
+		if ( IS_STRING(m->type) )
+			continue;
+
+		if ( m->num_mask )
+			printf("# CHECKME: use of bitmask\n");
+		}
+	}
+
+private void
+check_magic_reln_operator_usage(struct magic* mmpath, size_t n)
+	{
+	for ( size_t i = 0; i < n; ++i )
+		{
+		struct magic* m = &mmpath[i];
+
+		if ( m->reln != 'x' && m->reln != '=' )
+			printf("# CHECKME: use of relational operator %c\n", m->reln);
+		}
+	}
+
+private int
+get_match_len(struct magic* m)
+	{
+	switch ( m->type ) {
+	case FILE_BYTE:
+		return 1;
+
+	case FILE_SHORT:
+	case FILE_LESHORT:
+	case FILE_BESHORT:
+		return 2;
+
+	case FILE_LONG:
+	case FILE_BELONG:
+	case FILE_LELONG:
+		return 4;
+
+	case FILE_QUAD:
+	case FILE_BEQUAD:
+	case FILE_LEQUAD:
+		return 8;
+
+	case FILE_STRING:
+		if ( m->str_flags )
+			{
+			if ( m->str_flags & STRING_COMPACT_WHITESPACE ||
+			     m->str_flags & STRING_COMPACT_OPTIONAL_WHITESPACE )
+				return -1;
+			}
+		return m->vallen;
+
+	case FILE_REGEX:
+	case FILE_SEARCH:
+		return -1;
+
+	case FILE_DEFAULT:
+		return 0;
+	default:
+		return -1;
+	}
+	}
+
+private void
+print_string_regex(struct magic* m)
+	{
+	printf("(");
+	int ws_compact = 0;
+
+	if ( m->type == FILE_STRING || m->type == FILE_SEARCH )
+		ws_compact = m->str_flags & STRING_COMPACT_WHITESPACE;
+
+	int ws_optional = 0;
+
+	if ( m->type == FILE_STRING || m->type == FILE_SEARCH )
+		ws_optional = m->str_flags & STRING_COMPACT_OPTIONAL_WHITESPACE;
+
+	int ignore_upper = 0;
+
+	if ( m->type == FILE_STRING || m->type == FILE_SEARCH )
+		ignore_upper = m->str_flags & STRING_IGNORE_UPPERCASE;
+	else if ( m->type == FILE_REGEX )
+		ignore_upper = m->str_flags & STRING_IGNORE_CASE;
+	
+	int ignore_lower = 0;
+
+	if ( m->type == FILE_STRING || m->type == FILE_SEARCH )
+		ignore_lower = m->str_flags & STRING_IGNORE_LOWERCASE;
+	else if ( m->type == FILE_REGEX )
+		ignore_lower = m->str_flags & STRING_IGNORE_CASE;
+
+	// TODO: how to tell which characters of regex need escaping?
+	int escape_non_alphanumeric = m->type != FILE_REGEX;
+
+	for ( size_t i = 0; i < m->vallen; ++i )
+		{
+		char c = m->value.s[i];
+
+		if ( c == ' ' )
+			{
+			if ( ws_optional )
+				printf(" ?");
+			else if ( ws_compact )
+				{
+				int minimum_blanks = 0;
+
+				while ( i < m->vallen && m->value.s[i] == ' ' )
+					{
+					++minimum_blanks;
+					++i;
+					}
+
+				--i; // Iterated one too far.
+
+				printf(" {%d,}", minimum_blanks);
+				}
+			else
+				printf(" ");
+
+			continue;
+			}
+
+		if ( islower(c) )
+			{
+			if ( ignore_lower )
+				printf("[%c%c]", c, toupper(c));
+			else
+				print_char(c, escape_non_alphanumeric);
+			}
+		else if ( isupper(c) )
+			{
+			if ( ignore_upper )
+				printf("[%c%c]", c, tolower(c));
+			else
+				print_char(c, escape_non_alphanumeric);
+			}
+		else
+			{
+			print_char(c, escape_non_alphanumeric);
+			}
+		}
+	printf(")");
+	}
+
+private uint8_t
+swap_type_endian(uint8_t type, int swap_endian)
+	{
+	if ( ! swap_endian )
+		return type;
+
+	switch ( type ) {
+	case FILE_LESHORT:
+		return FILE_BESHORT;
+	case FILE_BESHORT:
+		return FILE_LESHORT;
+	case FILE_LELONG:
+		return FILE_BELONG;
+	case FILE_BELONG:
+		return FILE_LELONG;
+	case FILE_LEQUAD:
+		return FILE_BEQUAD;
+	case FILE_BEQUAD:
+		return FILE_LEQUAD;
+	default:
+		return type;
+	}
+	}
+
+private void
+print_bytes(const unsigned char* bytes, int n, int reverse)
+	{
+	printf("(");
+
+	if ( reverse )
+		{
+		for ( int i = n - 1; i >= 0; --i )
+			printf("\\x%02x", bytes[i]);
+		}
+	else
+		{
+		for ( int i = 0; i < n; ++i )
+			printf("\\x%02x", bytes[i]);
+		}
+
+	printf(")");
+	}
+
+private void
+print_bytes_both_orders(const unsigned char* bytes, size_t n)
+	{
+	printf("(");
+	print_bytes(bytes, n, 0);
+	printf("|");
+	print_bytes(bytes, n, 1);
+	printf(")");
+	}
+
+private void
+magic_byte_to_char_class(struct magic* m)
+	{
+	uint8_t cc[256];
+	int count = 0;
+	uint8_t magic_val = m->value.b;
+
+	// Probably a faster way, but bruteforce is good enough...
+	for ( int i = 0; i < 0xff + 1; ++i )
+		{
+		int matched = 0;
+		uint8_t file_val = i;
+
+		if ( m->num_mask )
+			{
+			switch ( m->mask_op & FILE_OPS_MASK ) {
+			case FILE_OPAND:
+				file_val &= m->num_mask;
+				break;
+			case FILE_OPOR:
+				file_val |= m->num_mask;
+				break;
+			case FILE_OPXOR:
+				file_val ^= m->num_mask;
+				break;
+			case FILE_OPADD:
+				file_val += m->num_mask;
+				break;
+			case FILE_OPMINUS:
+				file_val -= m->num_mask;
+				break;
+			case FILE_OPMULTIPLY:
+				file_val *= m->num_mask;
+				break;
+			case FILE_OPDIVIDE:
+				file_val /= m->num_mask;
+				break;
+			case FILE_OPMODULO:
+				file_val %= m->num_mask;
+				break;
+			default:
+				assert(0);
+				break;
+			}
+			}
+
+		if ( m->mask_op & FILE_OPINVERSE)
+			file_val = ~ file_val;
+
+		switch ( m->reln ) {
+		case '=':
+			matched = file_val == magic_val;
+			break;
+		case '!':
+			matched = file_val != magic_val;
+			break;
+		case '<':
+			if ( m->flag & UNSIGNED )
+				matched = file_val < magic_val;
+			else
+				matched = (int8_t) file_val < (int8_t) magic_val;
+			break;
+		case '>':
+			if ( m->flag & UNSIGNED )
+				matched = file_val > magic_val;
+			else
+				matched = (int8_t) file_val > (int8_t) magic_val;
+			break;
+		case '&':
+			matched = (file_val & magic_val) == magic_val;
+			break;
+		case '^':
+			// TODO: this is what libmagic does, but I'm not so sure
+			//       that looks right based on how the man page reads
+			//       (guess it just matters how the magic uses it, but
+			//       I have doubts) ...
+			matched = (file_val & magic_val) != magic_val;
+			break;
+		default:
+			assert(0);
+			break;
+		}
+
+		if ( matched )
+			{
+			cc[count] = i;
+			++count;
+			}
+		}
+
+	printf("([");
+	for ( int i = 0; i < count; ++i )
+		printf("\\x%02x", cc[i]);
+	printf("])");
+	}
+
+private void
+magic_val_to_regex_print(struct magic* m, int swap_endian)
+	{
+	switch ( m->type ) {
+	case FILE_BYTE:
+		if ( m->reln == 'x' )
+			{
+			printf("(.{1})");
+			break;
+			}
+
+		magic_byte_to_char_class(m);
+		break;
+
+	case FILE_SHORT:
+	case FILE_LESHORT:
+	case FILE_BESHORT:
+		{
+		if ( m->reln == 'x' )
+			{
+			printf("(.{2})");
+			break;
+			}
+
+		if ( m->reln != '=' || m->num_mask != 0 )
+			{
+			// Can't easily generate regex for these situations (or
+			// the generated regex may be unreasonably long).
+			// TODO: maybe try out generating character classes
+			//       and see how bad it is
+			printf("(.{2})");
+			break;
+			}
+
+		int16_t val = m->value.h;
+
+		if ( m->mask_op & FILE_OPINVERSE )
+			val = ~val;
+
+		const unsigned char* bytes = (const unsigned char*) &val;
+		int len = sizeof(val);
+		uint8_t typ = swap_type_endian(m->type, swap_endian);
+
+		if ( typ == FILE_LESHORT )
+			print_bytes(bytes, len, on_big_endian());
+		else if ( typ == FILE_BESHORT )
+			print_bytes(bytes, len, ! on_big_endian());
+		else
+			print_bytes_both_orders(bytes, len);
+		}
+		break;
+
+	case FILE_LONG:
+	case FILE_BELONG:
+	case FILE_LELONG:
+		{
+		if ( m->reln == 'x' )
+			{
+			printf("(.{4})");
+			break;
+			}
+
+		if ( m->reln != '=' || m->num_mask != 0 )
+			{
+			// Can't easily generate regex for these situations (or
+			// the generated regex may be unreasonably long).
+			printf("(.{4})");
+			break;
+			}
+
+		int32_t val = m->value.l;
+
+		if ( m->mask_op & FILE_OPINVERSE )
+			val = ~val;
+
+		const unsigned char* bytes = (const unsigned char*) &val;
+		int len = sizeof(val);
+		uint8_t typ = swap_type_endian(m->type, swap_endian);
+
+		if ( typ == FILE_LELONG )
+			print_bytes(bytes, len, on_big_endian());
+		else if ( typ == FILE_BELONG )
+			print_bytes(bytes, len, ! on_big_endian());
+		else
+			print_bytes_both_orders(bytes, len);
+		}
+		break;
+
+	case FILE_QUAD:
+	case FILE_BEQUAD:
+	case FILE_LEQUAD:
+		{
+		if ( m->reln == 'x' )
+			{
+			printf("(.{8})");
+			break;
+			}
+
+		if ( m->reln != '=' || m->num_mask != 0 )
+			{
+			// Can't easily generate regex for these situations (or
+			// the generated regex may be unreasonably long).
+			printf("(.{8})");
+			break;
+			}
+
+		int64_t val = m->value.q;
+
+		if ( m->mask_op & FILE_OPINVERSE )
+			val = ~val;
+
+		const unsigned char* bytes = (const unsigned char*) &val;
+		int len = sizeof(val);
+		uint8_t typ = swap_type_endian(m->type, swap_endian);
+
+		if ( typ == FILE_LEQUAD )
+			print_bytes(bytes, len, on_big_endian());
+		else if ( typ == FILE_BEQUAD )
+			print_bytes(bytes, len, ! on_big_endian());
+		else
+			print_bytes_both_orders(bytes, len);
+		}
+		break;
+
+	case FILE_STRING:
+		if ( m->reln == 'x' )
+			{
+			printf("(.{%u})", m->vallen);
+			break;
+			}
+
+		print_string_regex(m);
+		break;
+
+	case FILE_REGEX:
+		print_string_regex(m);
+		break;
+
+	case FILE_SEARCH:
+		if ( m->str_range )
+			// Using a range like this kills Bro's regex matching performance.
+			//printf("(.{0,%u})", m->str_range);
+			printf("(.*)");
+
+		if ( m->reln == 'x' )
+			// This doesn't make sense...
+			assert(0);
+
+		print_string_regex(m);
+		break;
+
+	case FILE_DEFAULT:
+	default:
+		break;
+	}
+	}
+
+private void
+bro_mdump(struct magic* m, int swap_endian)
+	{
+#define SZOF(a) (sizeof(a) / sizeof(a[0]))
+	static const char optyp[] = { FILE_OPS };
+	char tbuf[26];
+
+	(void) fprintf(stdout, "# %.*s", (m->cont_level & 7) + 1, ">>>>>>>>");
+
+	if ( m->flag & OFFADD )
+		fprintf(stdout, "&");
+
+	if ( m->flag & INDIROFFADD )
+		fprintf(stdout, "&(");
+
+	fprintf(stdout, "%u ", m->offset);
+
+    if (m->flag & INDIR) {
+        (void) fprintf(stdout, "(%s,",
+            /* Note: type is unsigned */
+            (m->in_type < file_nnames) ? file_names[m->in_type] :
+            "*bad in_type*");
+        if (m->in_op & FILE_OPINVERSE)
+            (void) fputc('~', stdout);
+        (void) fprintf(stdout, "%c%u),",
+            ((size_t)(m->in_op & FILE_OPS_MASK) <
+            SZOF(optyp)) ? optyp[m->in_op & FILE_OPS_MASK] : '?',
+            m->in_offset);
+    }
+
+    (void) fprintf(stdout, " %s%s", (m->flag & UNSIGNED) ? "u" : "",
+        /* Note: type is unsigned */
+        (m->type < file_nnames) ? file_names[m->type] : "*bad type");
+    if (m->mask_op & FILE_OPINVERSE)
+        (void) fputc('~', stdout);
+
+    if (IS_STRING(m->type)) {
+        if (m->str_flags) {
+            (void) fputc('/', stdout);
+            if (m->str_flags & STRING_COMPACT_WHITESPACE)
+                (void) fputc(CHAR_COMPACT_WHITESPACE, stdout);
+            if (m->str_flags & STRING_COMPACT_OPTIONAL_WHITESPACE)
+                (void) fputc(CHAR_COMPACT_OPTIONAL_WHITESPACE,
+                    stdout);
+            if (m->str_flags & STRING_IGNORE_LOWERCASE)
+                (void) fputc(CHAR_IGNORE_LOWERCASE, stdout);
+            if (m->str_flags & STRING_IGNORE_UPPERCASE)
+                (void) fputc(CHAR_IGNORE_UPPERCASE, stdout);
+            if (m->str_flags & REGEX_OFFSET_START)
+                (void) fputc(CHAR_REGEX_OFFSET_START, stdout);
+            if (m->str_flags & STRING_TEXTTEST)
+                (void) fputc(CHAR_TEXTTEST, stdout);
+            if (m->str_flags & STRING_BINTEST)
+                (void) fputc(CHAR_BINTEST, stdout);
+            if (m->str_flags & PSTRING_1_BE)
+                (void) fputc(CHAR_PSTRING_1_BE, stdout);
+            if (m->str_flags & PSTRING_2_BE)
+                (void) fputc(CHAR_PSTRING_2_BE, stdout);
+            if (m->str_flags & PSTRING_2_LE)
+                (void) fputc(CHAR_PSTRING_2_LE, stdout);
+            if (m->str_flags & PSTRING_4_BE)
+                (void) fputc(CHAR_PSTRING_4_BE, stdout);
+            if (m->str_flags & PSTRING_4_LE)
+                (void) fputc(CHAR_PSTRING_4_LE, stdout);
+            if (m->str_flags & PSTRING_LENGTH_INCLUDES_ITSELF)
+                (void) fputc(
+                    CHAR_PSTRING_LENGTH_INCLUDES_ITSELF,
+                    stdout);
+        }
+        if (m->str_range)
+            (void) fprintf(stdout, "/%u", m->str_range);
+    }
+	else {
+        if ((size_t)(m->mask_op & FILE_OPS_MASK) < SZOF(optyp))
+            (void) fputc(optyp[m->mask_op & FILE_OPS_MASK], stdout);
+        else
+            (void) fputc('?', stdout);
+
+        if (m->num_mask) {
+            (void) fprintf(stdout, "%.8llx",
+                (unsigned long long)m->num_mask);
+        }
+    }
+    (void) fprintf(stdout, ",%c", m->reln);
+    if (m->reln != 'x') {
+        switch (m->type) {
+        case FILE_BYTE:
+			printf("0x%02x", m->value.b);
+			break;
+
+        case FILE_SHORT:
+        case FILE_LESHORT:
+        case FILE_BESHORT:
+			if ( m->flag & UNSIGNED )
+				printf("%hu", m->value.h);
+			else
+				printf("%hd", m->value.h);
+			printf(" (0x%04x)", m->value.h);
+			break;
+
+        case FILE_LONG:
+        case FILE_LELONG:
+        case FILE_MELONG:
+        case FILE_BELONG:
+			if ( m->flag & UNSIGNED )
+				printf("%u", m->value.l);
+			else
+				printf("%d", m->value.l);
+			printf(" (0x%08x)", m->value.l);
+			break;
+
+        case FILE_INDIRECT:
+            (void) fprintf(stdout, "%d", m->value.l);
+            break;
+
+        case FILE_BEQUAD:
+        case FILE_LEQUAD:
+        case FILE_QUAD:
+			if ( m->flag & UNSIGNED )
+				printf("%llu", m->value.q);
+			else
+				printf("%lld", m->value.q);
+			printf(" (0x%016llx)", m->value.q);
+            break;
+
+        case FILE_PSTRING:
+        case FILE_STRING:
+        case FILE_REGEX:
+        case FILE_BESTRING16:
+        case FILE_LESTRING16:
+        case FILE_SEARCH:
+            file_showstr(stdout, m->value.s, (size_t)m->vallen);
+			printf(" (len=%u)", m->vallen);
+            break;
+        case FILE_DATE:
+        case FILE_LEDATE:
+        case FILE_BEDATE:
+        case FILE_MEDATE:
+            (void)fprintf(stdout, "%s,",
+                file_fmttime(m->value.l, FILE_T_LOCAL, tbuf));
+            break;
+        case FILE_LDATE:
+        case FILE_LELDATE:
+        case FILE_BELDATE:
+        case FILE_MELDATE:
+            (void)fprintf(stdout, "%s,",
+                file_fmttime(m->value.l, 0, tbuf));
+        case FILE_QDATE:
+        case FILE_LEQDATE:
+        case FILE_BEQDATE:
+            (void)fprintf(stdout, "%s,",
+                file_fmttime(m->value.q, FILE_T_LOCAL, tbuf));
+            break;
+        case FILE_QLDATE:
+        case FILE_LEQLDATE:
+        case FILE_BEQLDATE:
+            (void)fprintf(stdout, "%s,",
+                file_fmttime(m->value.q, 0, tbuf));
+            break;
+        case FILE_QWDATE:
+        case FILE_LEQWDATE:
+        case FILE_BEQWDATE:
+            (void)fprintf(stdout, "%s,",
+                file_fmttime(m->value.q, FILE_T_WINDOWS, tbuf));
+            break;
+        case FILE_FLOAT:
+        case FILE_BEFLOAT:
+        case FILE_LEFLOAT:
+            (void) fprintf(stdout, "%G", m->value.f);
+            break;
+        case FILE_DOUBLE:
+        case FILE_BEDOUBLE:
+        case FILE_LEDOUBLE:
+            (void) fprintf(stdout, "%G", m->value.d);
+            break;
+        case FILE_DEFAULT:
+            break;
+        case FILE_USE:
+        case FILE_NAME:
+            (void) fprintf(stdout, "'%s'", m->value.s);
+            break;
+        default:
+            (void) fprintf(stdout, "*bad type %d*", m->type);
+            break;
+        }
+    }
+    (void) fprintf(stdout, ", [\"%s\"], swap_endian=%d\n", m->desc, swap_endian);
+	}
+
+private void
+bro_sig_print(struct magic* mmpath, size_t n, int swap_endian, size_t swap_idx)
+	{
+	for ( size_t i = 0; i < n; ++i )
+		bro_mdump(&mmpath[i], swap_endian && i >= swap_idx );
+
+	const char* mimetype = mmpath[n - 1].mimetype;
+	size_t strength = apprentice_magic_strength(&mmpath[n - 1]);
+	static int sig_number = -1;
+
+	++sig_number;
+
+	printf("signature file-magic-auto%d {\n", sig_number);
+	printf("\tfile-mime \"%s\", %zu\n", mimetype, strength);
+
+	check_magic_offsets(mmpath, n);
+	check_magic_fixed_match_length(mmpath, n);
+	check_magic_type_compat(mmpath, n);
+	check_magic_offset_order(mmpath, n);
+	check_magic_bitmask_usage(mmpath, n);
+	check_magic_reln_operator_usage(mmpath, n);
+
+	printf("\tfile-magic /");
+
+	int last_offset = 0;    // -1 means unknown
+	int last_match_len = 0; // -1 means unknown
+
+	for ( size_t i = 0; i < n; ++i )
+		{
+		struct magic* m = &mmpath[i];
+
+		int gap_len = 0; // -1 means unknown
+
+		if ( last_offset >= 0 && last_match_len >= 0 )
+			{
+			if ( m->flag & INDIR )
+				; // Can't tell.
+			else if ( m->flag & OFFADD )
+				gap_len = m->offset;
+			else if ( m->flag & INDIROFFADD )
+				; // Can't tell.
+			else
+				gap_len = m->offset - (last_offset + last_match_len);
+			}
+		else
+			{
+			if ( m->flag & OFFADD )
+				gap_len = m->offset;
+			}
+
+		if ( gap_len > 0 )
+			// Have a known gap size between rule matches.
+			printf("(.{%d})", gap_len);
+		else if ( gap_len < 0 )
+			// Indeterminate gap size between rule matches.
+			printf("(.*)");
+
+		if ( last_offset >= 0 )
+			{
+			if ( m->flag & INDIR )
+				last_offset = -1;
+			else if ( m->flag & OFFADD )
+				{
+				if ( last_match_len >= 0 )
+					last_offset += last_match_len;
+				else
+					last_offset = -1;
+				}
+			else if ( m->flag & INDIROFFADD )
+				last_offset = -1;
+			else
+				last_offset = m->offset;
+			}
+
+		if ( last_match_len >= 0 )
+			last_match_len = get_match_len(m);
+
+		magic_val_to_regex_print(m, swap_endian && i >= swap_idx);
+		}
+
+	printf("/\n"); // end file-magic
+
+	printf("}\n");
+	printf("\n");
+	}
+
+/*
+ * Build a list of magic rules containing the path in the tree from
+ * a root magic node (continuation level 0) to the node at *magindex*.
+ */
+private struct magic*
+build_magic_path(const struct mlist* mlist, uint32_t magindex)
+	{
+	uint16_t cur_lvl = mlist->magic[magindex].cont_level;
+	struct magic* rval = CAST(struct magic*, calloc(cur_lvl + 1,
+	                                                sizeof(struct magic)));
+
+	if ( ! rval )
+		oom_exit();
+
+	memcpy(&rval[cur_lvl], &mlist->magic[magindex], sizeof(struct magic));
+
+	while ( cur_lvl != 0 )
+		{
+		--magindex;
+		struct magic* m = &mlist->magic[magindex];
+
+		if ( m->cont_level >= cur_lvl )
+			continue;
+
+		cur_lvl = m->cont_level;
+		memcpy(&rval[cur_lvl], &mlist->magic[magindex], sizeof(struct magic));
+		}
+
+	return rval;
+	}
+
+private struct magic*
+combine_magic_arrays(struct magic* a, size_t an, struct magic* b, size_t bn)
+	{
+	struct magic* rval = CAST(struct magic*, calloc(an + bn,
+	                                                sizeof(struct magic)));
+
+	if ( ! rval )
+		oom_exit();
+
+	memcpy(rval, a, an * sizeof(struct magic));
+	memcpy(&rval[an], b, bn * sizeof(struct magic));
+	return rval;
+	}
+
+private int
+use_equals_name(const char* name, const char* use, int* swap_endian)
+	{
+	*swap_endian = 0;
+
+	if ( strcmp(name, use) == 0 )
+		return 1;
+
+	if ( use[0] == '^' )
+		{
+		*swap_endian = 1;
+
+		if ( strcmp(name, use + 1) == 0 )
+			return 1;
+		}
+
+	return 0;
+	}
+
+private void
+resolve_name_usages_to_bro_sigs(const struct magic_set* mset,
+                                struct magic* mnamepath,
+                                size_t mnamepath_size)
+	{
+	for ( size_t li = 0; li < MAGIC_SETS; ++li )
+		{
+		struct mlist* mlist = mset->mlist[li];
+
+		for ( struct mlist* ml = mlist->next; ml != mlist; ml = ml->next )
+			{
+			for ( uint32_t magindex = 0; magindex < ml->nmagic; ++magindex )
+				{
+				if ( ml->magic[magindex].type != FILE_USE )
+					continue;
+
+				int swap_endian = 0;
+
+				if ( ! use_equals_name(mnamepath[0].value.s,
+				                       ml->magic[magindex].value.s,
+				                       &swap_endian) )
+					continue;
+
+				struct magic* musepath = build_magic_path(ml, magindex);
+				size_t musepath_size = ml->magic[magindex].cont_level + 1;
+
+				// Cut off last element of musepath (the "use") and first
+				// element of mnamepath (the "name).
+				struct magic* combined_path =
+					combine_magic_arrays(musepath, musepath_size - 1,
+										 &mnamepath[1], mnamepath_size - 1);
+				size_t cp_len = musepath_size - 1 + mnamepath_size - 1;
+
+				for ( size_t i = musepath_size - 1; i < cp_len; ++i )
+					{
+					// Adjust continuation levels.
+					combined_path[i].cont_level +=
+						musepath[musepath_size - 1].cont_level - 1;
+					}
+
+				bro_sig_print(combined_path, cp_len, swap_endian,
+				              musepath_size - 1);
+				free(musepath);
+				free(combined_path);
+				}
+			}
+		}
+	}
+
+private void
+apprentice_bro_sigs(const struct mlist* mlist, const struct magic_set* mset)
+	{
+	for ( struct mlist* ml = mlist->next; ml != mlist; ml = ml->next )
+		{
+		for ( uint32_t magindex = 0; magindex < ml->nmagic; ++magindex )
+			{
+			if ( strlen(ml->magic[magindex].mimetype) == 0  )
+				continue;
+
+			/*
+			printf("%d %d %s %s\n", magindex,
+			       ml->magic[magindex].cont_level,
+			       ml->magic[magindex].desc,
+			       ml->magic[magindex].mimetype);
+			*/
+
+			struct magic* mmpath = build_magic_path(ml, magindex);
+			size_t mmpath_size = ml->magic[magindex].cont_level + 1;
+
+			if ( mmpath[0].type == FILE_NAME )
+				resolve_name_usages_to_bro_sigs(mset, mmpath, mmpath_size);
+			else
+				bro_sig_print(mmpath, mmpath_size, 0, 0);
+
+			free(mmpath);
+			}
+		}
+	}
+
 /*
  * Handle one file or directory.
  */
@@ -448,6 +1474,13 @@ apprentice_1(struct magic_set *ms, const char *fn, int action)
 			apprentice_list(ms->mlist[i], TEXTTEST);
 		}
 	}
+	else if ( action == FILE_BRO )
+		{
+		for ( i = 0; i < MAGIC_SETS; ++i )
+			{
+			apprentice_bro_sigs(ms->mlist[i], ms);
+			}
+		}
 	
 	return 0;
 #endif /* COMPILE_ONLY */
@@ -621,6 +1654,7 @@ file_apprentice(struct magic_set *ms, const char *fn, int action)
 	case FILE_COMPILE:
 	case FILE_CHECK:
 	case FILE_LIST:
+	case FILE_BRO:
 		return 0;
 	default:
 		file_error(ms, 0, "Invalid action %d", action);
